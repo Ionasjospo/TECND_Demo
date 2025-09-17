@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL_PROD", "").strip()
 PRODUCT_ID   = os.getenv("PRODUCT_ID", "demo_product")
 MIN_CONF     = float(os.getenv("MIN_CONFIDENCE", "0.6"))
 
