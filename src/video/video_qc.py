@@ -1,60 +1,48 @@
-import os, time, json
-import cv2
-import numpy as np
-import requests
+import os, json, cv2, numpy as np, requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from queue import Queue, Empty
+from threading import Thread, Event
 
 load_dotenv()
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL_PROD", "").strip()
-PRODUCT_BASE   = os.getenv("PRODUCT_BASE", "demo_product")
-MIN_CONF     = float(os.getenv("MIN_CONFIDENCE", "0.6"))
+# ---- Config desde .env ----
+WEBHOOK_URL   = os.getenv("WEBHOOK_URL_PROD", "").strip()
+PRODUCT_BASE  = os.getenv("PRODUCT_BASE", "galletita")
+MIN_CONF      = float(os.getenv("MIN_CONFIDENCE", "0.30"))         # umbral razonable
+CONF_MULT     = float(os.getenv("CONF_AREA_MULTIPLIER", "25.0"))   # escala de área->conf
 
-# ---- HSV ranges ----
-GREEN_LOWER = np.array([35, 80, 50])
-GREEN_UPPER = np.array([85, 255, 255])
-
-RED1_LOWER  = np.array([0, 100, 80])
-RED1_UPPER  = np.array([10, 255, 255])
-RED2_LOWER  = np.array([170, 100, 80])
-RED2_UPPER  = np.array([180, 255, 255])
+# ---- HSV ----
+GREEN_LOWER = np.array([35, 80, 50]);  GREEN_UPPER = np.array([85, 255, 255])
+RED1_LOWER  = np.array([0, 100, 80]);  RED1_UPPER  = np.array([10, 255, 255])
+RED2_LOWER  = np.array([170,100, 80]); RED2_UPPER  = np.array([180,255,255])
 
 KERNEL3 = np.ones((3,3), np.uint8)
 KERNEL5 = np.ones((5,5), np.uint8)
 
-# MODO PER-FRAME: enviar un evento cada N frames mientras haya defecto
-PER_FRAME_INTERVAL = 5  # 5 -> ~6 eventos/seg a 30 FPS
+# enviar cada N frames (evita saturar)
+PER_FRAME_INTERVAL = 3
 
-
-from queue import Queue, Empty
-from threading import Thread, Event
-
-# Sesión HTTP reutilizable (menos overhead de TCP)
+# ---- sender asíncrono (no bloquea el video) ----
 SESSION = requests.Session()
-
-# Cola de envíos y worker
-send_q: Queue = Queue(maxsize=100)
+send_q: Queue = Queue(maxsize=200)
 stop_ev = Event()
 
 def sender_worker():
-    """Consume payloads y los envía a n8n sin bloquear el hilo de video."""
     while not stop_ev.is_set():
         try:
             payload = send_q.get(timeout=0.1)
         except Empty:
             continue
         try:
-            r = SESSION.post(WEBHOOK_URL, json=payload, timeout=3)  # timeout corto
+            r = SESSION.post(WEBHOOK_URL, json=payload, timeout=3)
             print("[n8n]", r.status_code, str(r.text)[:120])
         except Exception as e:
-            print("Error enviando a n8n (se continúa):", e)
+            print("Error enviando a n8n:", e)
         finally:
             send_q.task_done()
 
-
-
-def find_boxes(hsv, lower, upper, min_area=450):
+def find_boxes(hsv, lower, upper, min_area=650):
     mask = cv2.inRange(hsv, lower, upper)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL3)
     mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, KERNEL5)
@@ -67,23 +55,11 @@ def find_boxes(hsv, lower, upper, min_area=450):
             boxes.append((x,y,w,h,area))
     return boxes
 
-def confidence(area, denom_area):
-    rel = area / float(denom_area)
-    return float(min(1.0, rel * 10.0))  # simple para demo
+def area_conf(area, denom_area):
+    # relación de área * multiplicador configurable
+    return float(min(1.0, (area / float(denom_area)) * CONF_MULT))
 
-def send_to_n8n(payload: dict):
-    if not WEBHOOK_URL:
-        print("ERROR: WEBHOOK_URL vacío en .env"); return
-    try:
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=5)
-        print("[n8n]", r.status_code, r.text[:200])
-    except Exception as e:
-        print("Error enviando a n8n:", e)
-
-def run_video(video_path: str = "assets/galletitas.mp4"):
-    th = Thread(target=sender_worker, daemon=True)
-    th.start()
-    
+def run_video(video_path="assets/galletitas.mp4"):
     if not os.path.isfile(video_path):
         print(f"No existe el archivo de video: {video_path}"); return
 
@@ -91,87 +67,102 @@ def run_video(video_path: str = "assets/galletitas.mp4"):
     if not cap.isOpened():
         print("No se pudo abrir el video."); return
 
-    # ROI (estación de control) – ajusta a tu video
-    use_roi = True
-    ROI = (220, 80, 520, 380)  # x, y, w, h
+    # ROI (estación)
+    RX, RY, RW, RH = 220, 80, 520, 380
+    LEFT_EDGE = RX + 8   # borde izquierdo "útil" para armar/disparar
 
-    def in_roi(box, roi):
-        x,y,w,h,_ = box
-        rx,ry,rw,rh = roi
-        return not (x+w < rx or x > rx+rw or y+h < ry or y > ry+rh)
+    # 2 carriles (coincide con tu generador)
+    LANES = 2
+    lane_h = RH // LANES
+    lane_armed = [True] * LANES             # listo para disparar
+    product_seq = 1
+    frame_no = 0
 
-    frame_no = 0  # <-- contador LOCAL
-    product_seq = 1  # <-- secuencia LOCAL
+    # hilo del sender
+    th = Thread(target=sender_worker, daemon=True); th.start()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop para demo
-            continue
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            frame_no += 1
 
-        frame_no += 1
+            h, w = frame.shape[:2]
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        h, w = frame.shape[:2]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            # detectar
+            green_boxes = find_boxes(hsv, GREEN_LOWER, GREEN_UPPER)
+            red_boxes   = find_boxes(hsv, RED1_LOWER, RED1_UPPER) + \
+                          find_boxes(hsv, RED2_LOWER, RED2_UPPER)
 
-        # Detecciones
-        green_boxes = find_boxes(hsv, GREEN_LOWER, GREEN_UPPER)
-        red_boxes   = find_boxes(hsv, RED1_LOWER, RED1_UPPER) + \
-                      find_boxes(hsv, RED2_LOWER, RED2_UPPER)
+            # dibujar ROI
+            cv2.rectangle(frame, (RX,RY), (RX+RW,RY+RH), (255,255,0), 2)
 
-        # ROI + área de referencia para confianza
-        denom_area = w * h
-        if use_roi:
-            x0,y0,w0,h0 = ROI
-            cv2.rectangle(frame,(x0,y0),(x0+w0,y0+h0),(255,255,0),2)
-            red_boxes = [b for b in red_boxes if in_roi(b, ROI)]
-            denom_area = w0 * h0
+            # filtrar a ROI y seleccionar "mejor" blob por lane (mayor área)
+            best = [None]*LANES
+            denom_area = RW * RH
+            for (x,y,bw,bh,area) in red_boxes:
+                cx, cy = x + bw//2, y + bh//2
+                if not (RX <= cx <= RX+RW and RY <= cy <= RY+RH):  # fuera de ROI
+                    continue
+                lane = int((cy - RY) / lane_h)
+                lane = max(0, min(LANES-1, lane))
+                if best[lane] is None or area > best[lane][-1]:
+                    best[lane] = (x,y,bw,bh,area,cx,cy)
 
-        # Pintar
-        for (x,y,bw,bh,_) in green_boxes:
-            cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,255,0),2)
-            cv2.putText(frame,"GOOD",(x,y-5),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
+            # dibujar verdes
+            for (x,y,bw,bh,_) in green_boxes:
+                cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,255,0),2)
+                cv2.putText(frame,"GOOD",(x,y-5),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2)
 
-        max_conf = 0.0
-        for (x,y,bw,bh,area) in red_boxes:
-            cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,0,255),2)
-            cv2.putText(frame,"DEFECT",(x,y-5),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
-            max_conf = max(max_conf, confidence(area, denom_area))
+            # por lane: mostrar y disparar 1 vez cuando entra por la izquierda
+            total_def = 0
+            for lane in range(LANES):
+                if best[lane] is None: 
+                    continue
+                x,y,bw,bh,area,cx,cy = best[lane]
+                conf = area_conf(area, denom_area)
+                total_def += 1
+                # pintar rojo
+                cv2.rectangle(frame,(x,y),(x+bw,y+bh),(0,0,255),2)
+                cv2.putText(frame,f"DEFECT {conf:.2f}",(x,y-5),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
 
-        cv2.putText(frame, f"Conf:{max_conf:.2f}", (10,50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-        cv2.putText(frame, f"Good:{len(green_boxes)}  Defects:{len(red_boxes)}",
-                    (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                # re-armar cuando aparece algo a la izquierda de la ROI
+                if cx < LEFT_EDGE - 12:
+                    lane_armed[lane] = True
 
-        # --- envío per-frame ---
-        has_defect = (len(red_boxes) > 0) and (max_conf >= MIN_CONF)
-        if has_defect and (frame_no % PER_FRAME_INTERVAL == 0):
-            product_id = f"{PRODUCT_BASE}-{product_seq:04d}"
-            payload = {
-                "product_id":  product_id,
-                "defect_type": "color_red",
-                "confidence":  round(max_conf, 3),
-                "is_defect":   True,
-                "timestamp":   datetime.now(timezone.utc).isoformat()
-            }
-            print("Enviando a n8n:", json.dumps(payload))
-            product_seq += 1
-            try:
-                send_q.put_nowait(payload)
-            except:
-                # Si la cola está llena, descarta para no frenar el video
-                print("send_q llena: se descarta evento para mantener FPS")
+                # disparo: cruza a la ROI desde la izquierda y está armado
+                should_fire = (lane_armed[lane] and cx >= LEFT_EDGE and
+                               conf >= MIN_CONF and (frame_no % PER_FRAME_INTERVAL == 0))
+                if should_fire:
+                    product_id = f"{PRODUCT_BASE}-{product_seq:04d}"
+                    payload = {
+                        "product_id":  product_id,
+                        "defect_type": "color_red",
+                        "confidence":  round(conf, 3),
+                        "is_defect":   True,
+                        "timestamp":   datetime.now(timezone.utc).isoformat()
+                    }
+                    print("POST →", json.dumps(payload))
+                    product_seq += 1
+                    lane_armed[lane] = False     # evita múltiples POST por la misma galleta
+                    try:
+                        send_q.put_nowait(payload)  # asíncrono
+                    except:
+                        print("send_q llena: descartado para mantener FPS")
 
-        cv2.imshow("QC Vision (video) - q=quit", frame)
-        if (cv2.waitKey(25) & 0xFF) == ord('q'):
-            break
+            # overlay
+            cv2.putText(frame, f"Defects:{total_def}", (10,25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
 
-    # parar hilo sender
-    stop_ev.set()
-    th.join(timeout=1.0)
-        
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.imshow("QC Vision (video) - q=quit", frame)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                break
+    finally:
+        stop_ev.set(); th.join(timeout=1.0)
+        cap.release(); cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     run_video()
