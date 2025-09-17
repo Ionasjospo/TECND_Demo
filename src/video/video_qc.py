@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL_PROD", "").strip()
-PRODUCT_ID   = os.getenv("PRODUCT_ID", "demo_product")
+PRODUCT_BASE   = os.getenv("PRODUCT_BASE", "demo_product")
 MIN_CONF     = float(os.getenv("MIN_CONFIDENCE", "0.6"))
 
 # ---- HSV ranges ----
@@ -25,6 +25,34 @@ KERNEL5 = np.ones((5,5), np.uint8)
 
 # MODO PER-FRAME: enviar un evento cada N frames mientras haya defecto
 PER_FRAME_INTERVAL = 5  # 5 -> ~6 eventos/seg a 30 FPS
+
+
+from queue import Queue, Empty
+from threading import Thread, Event
+
+# Sesión HTTP reutilizable (menos overhead de TCP)
+SESSION = requests.Session()
+
+# Cola de envíos y worker
+send_q: Queue = Queue(maxsize=100)
+stop_ev = Event()
+
+def sender_worker():
+    """Consume payloads y los envía a n8n sin bloquear el hilo de video."""
+    while not stop_ev.is_set():
+        try:
+            payload = send_q.get(timeout=0.1)
+        except Empty:
+            continue
+        try:
+            r = SESSION.post(WEBHOOK_URL, json=payload, timeout=3)  # timeout corto
+            print("[n8n]", r.status_code, str(r.text)[:120])
+        except Exception as e:
+            print("Error enviando a n8n (se continúa):", e)
+        finally:
+            send_q.task_done()
+
+
 
 def find_boxes(hsv, lower, upper, min_area=450):
     mask = cv2.inRange(hsv, lower, upper)
@@ -53,6 +81,9 @@ def send_to_n8n(payload: dict):
         print("Error enviando a n8n:", e)
 
 def run_video(video_path: str = "assets/galletitas.mp4"):
+    th = Thread(target=sender_worker, daemon=True)
+    th.start()
+    
     if not os.path.isfile(video_path):
         print(f"No existe el archivo de video: {video_path}"); return
 
@@ -70,6 +101,7 @@ def run_video(video_path: str = "assets/galletitas.mp4"):
         return not (x+w < rx or x > rx+rw or y+h < ry or y > ry+rh)
 
     frame_no = 0  # <-- contador LOCAL
+    product_seq = 1  # <-- secuencia LOCAL
 
     while True:
         ok, frame = cap.read()
@@ -114,20 +146,30 @@ def run_video(video_path: str = "assets/galletitas.mp4"):
         # --- envío per-frame ---
         has_defect = (len(red_boxes) > 0) and (max_conf >= MIN_CONF)
         if has_defect and (frame_no % PER_FRAME_INTERVAL == 0):
+            product_id = f"{PRODUCT_BASE}-{product_seq:04d}"
             payload = {
-                "product_id":  PRODUCT_ID,
+                "product_id":  product_id,
                 "defect_type": "color_red",
                 "confidence":  round(max_conf, 3),
                 "is_defect":   True,
                 "timestamp":   datetime.now(timezone.utc).isoformat()
             }
             print("Enviando a n8n:", json.dumps(payload))
-            send_to_n8n(payload)
+            product_seq += 1
+            try:
+                send_q.put_nowait(payload)
+            except:
+                # Si la cola está llena, descarta para no frenar el video
+                print("send_q llena: se descarta evento para mantener FPS")
 
         cv2.imshow("QC Vision (video) - q=quit", frame)
         if (cv2.waitKey(25) & 0xFF) == ord('q'):
             break
 
+    # parar hilo sender
+    stop_ev.set()
+    th.join(timeout=1.0)
+        
     cap.release()
     cv2.destroyAllWindows()
 
